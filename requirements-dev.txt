@@ -1,0 +1,5 @@
+# Local development: tests, local server (simulated AWS) and template linting
+-r requirements.txt
+moto[s3,sqs,sns,dynamodb]>=5.0
+pytest>=8.0
+cfn-lint>=1.0

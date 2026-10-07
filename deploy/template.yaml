@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AQMon - Sydney Air Quality Monitoring & Alert Platform.
+  Event-driven serverless pipeline: S3 -> SQS -> Lambda -> DynamoDB, with
+  Cognito-protected HTTP API, SNS alerts, EventBridge schedule, CloudWatch
+  monitoring and a CloudFront-hosted dashboard.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address that receives SNS alerts and daily reports (confirm the subscription email).
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  LabRoleArn:
+    Type: String
+    Default: ""
+    Description: >
+      AWS Academy Learner Lab only - ARN of the existing LabRole
+      (arn:aws:iam::<account-id>:role/LabRole). Leave empty in a normal AWS
+      account; the stack then creates one least-privilege role per function.
+  Pm25DailyLimit:
+    Type: Number
+    Default: 25
+    Description: PM2.5 24-hour mean limit (ug/m3) that triggers an alert.
+  Pm10DailyLimit:
+    Type: Number
+    Default: 50
+    Description: PM10 24-hour mean limit (ug/m3) that triggers an alert.
+  LocalDevUrl:
+    Type: String
+    Default: http://localhost:8080/
+    Description: Origin allowed for running the frontend locally.
+
+Conditions:
+  UseLabRole: !Not [!Equals [!Ref LabRoleArn, ""]]
+  CreateRoles: !Equals [!Ref LabRoleArn, ""]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: ../code/backend/
+    MemorySize: 256
+    Timeout: 30
+    Environment:
+      Variables:
+        DAILY_TABLE: !Ref DailyStatsTable
+        META_TABLE: !Ref MetaTable
+        RAW_BUCKET: !Ref RawBucket
+        ALERT_TOPIC_ARN: !Ref AlertTopic
+        DLQ_URL: !Ref IngestDLQ
+        PM25_DAILY_LIMIT: !Ref Pm25DailyLimit
+        PM10_DAILY_LIMIT: !Ref Pm10DailyLimit
+        MAX_UPLOAD_BYTES: "5242880"
+        LOG_LEVEL: INFO
+
+Resources:
+  # ---------------------------------------------------------------- Storage (S3)
+  RawBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestQueuePolicy
+    Properties:
+      BucketName: !Sub aqmon-raw-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins:
+              - !Sub https://${Distribution.DomainName}
+              - !Sub
+                - "${Scheme}://${Host}"
+                - Scheme: !Select [0, !Split ["://", !Ref LocalDevUrl]]
+                  Host: !Select [0, !Split ["/", !Select [1, !Split ["://", !Ref LocalDevUrl]]]]
+            AllowedHeaders: ["*"]
+            MaxAge: 600
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IngestQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .csv
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt RawBucket.Arn
+              - !Sub ${RawBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aqmon-site-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub ${SiteBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------- Messaging (SQS)
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aqmon-ingest-queue
+      VisibilityTimeout: 180 # 6 x the processor timeout
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aqmon-ingest-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowRawBucketEvents
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:s3:::aqmon-raw-${AWS::AccountId}-${AWS::Region}
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------- Database (DynamoDB)
+  DailyStatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: aqmon-daily-stats
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  MetaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: aqmon-meta
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------------------------------------------------------------- Notifications (SNS)
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aqmon-alerts
+      DisplayName: AQMon Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------- Authentication (Cognito)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: aqmon-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UploadersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: uploaders
+      Description: Users allowed to upload air-quality CSV files
+      UserPoolId: !Ref UserPool
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub aqmon-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: aqmon-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub https://${Distribution.DomainName}/
+        - !Ref LocalDevUrl
+      LogoutURLs:
+        - !Sub https://${Distribution.DomainName}/
+        - !Ref LocalDevUrl
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH]
+      PreventUserExistenceErrors: ENABLED
+
+  # ---------------------------------------------------------------- API (API Gateway HTTP API)
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: AQMon REST endpoints (Cognito JWT required)
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience:
+                - !Ref UserPoolClient
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub https://${Distribution.DomainName}
+          - !Sub
+            - "${Scheme}://${Host}"
+            - Scheme: !Select [0, !Split ["://", !Ref LocalDevUrl]]
+              Host: !Select [0, !Split ["/", !Select [1, !Split ["://", !Ref LocalDevUrl]]]]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, OPTIONS]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency","user":"$context.authorizer.claims.sub","error":"$context.authorizer.error"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/aqmon-api
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------- Compute (Lambda)
+  UploadUrlFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: UploadUrlLogGroup
+    Properties:
+      FunctionName: aqmon-upload-url
+      Description: Issues presigned S3 POST URLs for CSV uploads
+      Handler: upload_url.handler
+      Role: !If [UseLabRole, !Ref LabRoleArn, !GetAtt UploadUrlRole.Arn]
+      Events:
+        CreateUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /uploads
+            Method: POST
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: aqmon-processor
+      Description: Consumes SQS upload events, aggregates readings, writes DynamoDB, raises alerts
+      Handler: processor.handler
+      Timeout: 30
+      MemorySize: 512
+      Role: !If [UseLabRole, !Ref LabRoleArn, !GetAtt ProcessorRole.Arn]
+      Events:
+        IngestQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: QueryLogGroup
+    Properties:
+      FunctionName: aqmon-query
+      Description: Read API - stations, daily statistics, analytics summary, alerts, uploads
+      Handler: query.handler
+      Events:
+        Stations:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /stations, Method: GET}
+        Daily:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /daily, Method: GET}
+        Summary:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /summary, Method: GET}
+        Alerts:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /alerts, Method: GET}
+        Uploads:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /uploads, Method: GET}
+      Role: !If [UseLabRole, !Ref LabRoleArn, !GetAtt QueryRole.Arn]
+
+  SummaryFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: SummaryLogGroup
+    Properties:
+      FunctionName: aqmon-daily-summary
+      Description: Scheduled daily operations report sent through SNS
+      Handler: summary.handler
+      Role: !If [UseLabRole, !Ref LabRoleArn, !GetAtt SummaryRole.Arn]
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Name: aqmon-daily-report
+            Description: Daily AQMon operations report (21:00 UTC = 08:00 Sydney summer time)
+            Schedule: cron(0 21 * * ? *)
+            Enabled: true
+
+  UploadUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/aqmon-upload-url, RetentionInDays: 14}
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/aqmon-processor, RetentionInDays: 14}
+  QueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/aqmon-query, RetentionInDays: 14}
+  SummaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/aqmon-daily-summary, RetentionInDays: 14}
+
+  # ---------------------------------------------------------------- IAM (normal AWS accounts only)
+  UploadUrlRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: aqmon-upload-url-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: least-privilege
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::aqmon-raw-${AWS::AccountId}-${AWS::Region}/raw/*
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt MetaTable.Arn
+
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: aqmon-processor-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: least-privilege
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::aqmon-raw-${AWS::AccountId}-${AWS::Region}/raw/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::aqmon-raw-${AWS::AccountId}-${AWS::Region}/processed/*
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:BatchWriteItem]
+                Resource: [!GetAtt DailyStatsTable.Arn, !GetAtt MetaTable.Arn]
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt IngestQueue.Arn
+
+  QueryRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: aqmon-query-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: least-privilege
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: [!GetAtt DailyStatsTable.Arn, !GetAtt MetaTable.Arn]
+
+  SummaryRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: aqmon-summary-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: least-privilege
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:Query]
+                Resource: !GetAtt MetaTable.Arn
+              - Effect: Allow
+                Action: sqs:GetQueueAttributes
+                Resource: !GetAtt IngestDLQ.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  # ---------------------------------------------------------------- Hosting (CloudFront)
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub aqmon-site-oac-${AWS::Region}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: AQMon dashboard
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+
+  # ---------------------------------------------------------------- Monitoring (CloudWatch)
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aqmon-dlq-not-empty
+      AlarmDescription: A message failed processing 3 times and was moved to the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aqmon-processor-errors
+      AlarmDescription: The processor Lambda reported errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: aqmon-dashboard
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+               "properties": {"markdown": "# AQMon - Sydney Air Quality pipeline\nS3 upload -> SQS -> Lambda processor -> DynamoDB -> HTTP API -> CloudFront dashboard. Alerts via SNS."}},
+              {"type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+               "properties": {"title": "Lambda invocations", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                 "metrics": [
+                   ["AWS/Lambda", "Invocations", "FunctionName", "${UploadUrlFunction}"],
+                   ["...", "${ProcessorFunction}"],
+                   ["...", "${QueryFunction}"],
+                   ["...", "${SummaryFunction}"]]}},
+              {"type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+               "properties": {"title": "Lambda errors and throttles", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                 "metrics": [
+                   ["AWS/Lambda", "Errors", "FunctionName", "${ProcessorFunction}"],
+                   ["...", "${QueryFunction}"],
+                   ["...", "${UploadUrlFunction}"],
+                   ["AWS/Lambda", "Throttles", "FunctionName", "${ProcessorFunction}"]]}},
+              {"type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+               "properties": {"title": "Ingest queue (SQS)", "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                 "metrics": [
+                   ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${QueueName}"],
+                   [".", "NumberOfMessagesDeleted", ".", "."],
+                   [".", "ApproximateNumberOfMessagesVisible", ".", ".", {"stat": "Maximum"}],
+                   [".", "ApproximateNumberOfMessagesVisible", ".", "${DlqName}", {"stat": "Maximum", "label": "DLQ messages"}]]}},
+              {"type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
+               "properties": {"title": "Processing results (custom metrics)", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                 "metrics": [
+                   ["AQMon", "FilesProcessed", "Service", "processor"],
+                   [".", "DailyRecordsWritten", ".", "."],
+                   [".", "ExceedancesDetected", ".", "."],
+                   [".", "RowsRejected", ".", "."],
+                   [".", "FilesRejected", ".", "."]]}},
+              {"type": "metric", "x": 0, "y": 14, "width": 12, "height": 6,
+               "properties": {"title": "HTTP API requests and errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                 "metrics": [
+                   ["AWS/ApiGateway", "Count", "ApiId", "${Api}"],
+                   [".", "4xx", ".", "."],
+                   [".", "5xx", ".", "."]]}},
+              {"type": "metric", "x": 12, "y": 14, "width": 12, "height": 6,
+               "properties": {"title": "Latency (ms)", "region": "${AWS::Region}", "period": 300, "view": "timeSeries",
+                 "metrics": [
+                   ["AWS/ApiGateway", "Latency", "ApiId", "${Api}", {"stat": "p90", "label": "API p90"}],
+                   ["AWS/Lambda", "Duration", "FunctionName", "${ProcessorFunction}", {"stat": "Average", "label": "Processor avg"}]]}},
+              {"type": "metric", "x": 0, "y": 20, "width": 12, "height": 6,
+               "properties": {"title": "DynamoDB write capacity consumed", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                 "metrics": [
+                   ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${DailyStatsTable}"],
+                   ["...", "${MetaTable}"]]}},
+              {"type": "alarm", "x": 12, "y": 20, "width": 12, "height": 6,
+               "properties": {"title": "Alarms", "alarms": ["${DlqAlarm.Arn}", "${ProcessorErrorAlarm.Arn}"]}}
+            ]
+          }
+        - QueueName: !GetAtt IngestQueue.QueueName
+          DlqName: !GetAtt IngestDLQ.QueueName
+
+Outputs:
+  SiteUrl:
+    Description: Public HTTPS URL of the dashboard
+    Value: !Sub https://${Distribution.DomainName}/
+  ApiUrl:
+    Description: HTTP API base URL
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  Region:
+    Value: !Ref AWS::Region
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub aqmon-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com
+  RawBucketName:
+    Value: !Ref RawBucket
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  IngestQueueUrl:
+    Value: !Ref IngestQueue
+  DeadLetterQueueUrl:
+    Value: !Ref IngestDLQ
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/aqmon-dashboard

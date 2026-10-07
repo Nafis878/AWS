@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.aws-sam/
+samconfig.toml
+code/frontend/config.js
+.DS_Store

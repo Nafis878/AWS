@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AQMon Sydney</title>
+  <meta name="description" content="Sydney air-quality monitoring and alert dashboard">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◎</span>
+      <div>
+        <h1>AQMon Sydney</h1>
+        <p class="sub">Air-quality monitoring &amp; alert platform</p>
+      </div>
+    </div>
+    <div class="user" id="user-box" hidden>
+      <span id="user-email"></span>
+      <span class="badge" id="user-role"></span>
+      <button class="btn ghost" id="logout-btn" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="banner" class="banner" role="alert" hidden></div>
+
+    <!-- Signed-out view -->
+    <section id="landing" class="landing" hidden>
+      <h2>Sydney air quality, processed in the cloud</h2>
+      <p>Upload hourly readings from NSW Government monitoring stations (OpenAQ archive format).
+        Files are queued, processed by serverless functions, stored in DynamoDB and turned into
+        daily statistics, limit-exceedance alerts and charts.</p>
+      <button class="btn primary" id="login-btn" type="button">Sign in / Create account</button>
+    </section>
+
+    <!-- Signed-in view -->
+    <section id="app" hidden>
+      <div class="tiles" id="tiles" aria-live="polite"></div>
+
+      <div class="grid two">
+        <section class="card" id="upload-card">
+          <h2>Upload data</h2>
+          <div id="upload-allowed" hidden>
+            <p class="muted">OpenAQ CSV files, max 5&nbsp;MB each. Sample files are in <code>data/sydney/</code> of the repository.</p>
+            <label class="file">
+              <input type="file" id="file-input" accept=".csv,text/csv" multiple>
+              <span>Choose CSV files…</span>
+            </label>
+            <button class="btn primary" id="upload-btn" type="button" disabled>Upload</button>
+            <ul class="upload-progress" id="upload-progress"></ul>
+          </div>
+          <p id="upload-denied" class="muted" hidden>Your account is view-only. Ask an administrator to add you to the <code>uploaders</code> group.</p>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Processing jobs</h2>
+            <span class="muted small" id="jobs-note"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data" id="uploads-table">
+              <thead><tr><th>File</th><th>Status</th><th>Rows</th><th>Daily records</th><th>Alerts</th><th>Received</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="filters" role="group" aria-label="Chart filters">
+          <label>Pollutant
+            <select id="f-param">
+              <option value="pm25">PM2.5 (µg/m³)</option>
+              <option value="pm10">PM10 (µg/m³)</option>
+              <option value="no2">NO₂ (ppm)</option>
+              <option value="o3">O₃ (ppm)</option>
+              <option value="co">CO (ppm)</option>
+              <option value="so2">SO₂ (ppm)</option>
+            </select>
+          </label>
+          <label>From <input type="date" id="f-from" value="2020-01-01"></label>
+          <label>To <input type="date" id="f-to" value="2020-06-30"></label>
+          <button class="btn" id="refresh-btn" type="button">Refresh</button>
+        </div>
+
+        <h2 id="daily-title">Daily mean by station</h2>
+        <div class="chart tall"><canvas id="chart-daily" aria-label="Daily mean by station line chart" role="img"></canvas></div>
+      </section>
+
+      <div class="grid two">
+        <section class="card">
+          <h2>Monthly average by station</h2>
+          <div class="chart"><canvas id="chart-monthly" role="img" aria-label="Monthly average bar chart"></canvas></div>
+        </section>
+        <section class="card">
+          <h2 id="exceed-title">Days above the 24-hour limit</h2>
+          <div class="chart"><canvas id="chart-exceed" role="img" aria-label="Exceedance days bar chart"></canvas></div>
+          <p class="muted small" id="exceed-note"></p>
+        </section>
+      </div>
+
+      <div class="grid two">
+        <section class="card" id="category-card">
+          <h2>PM2.5 daily category mix</h2>
+          <div class="chart"><canvas id="chart-category" role="img" aria-label="PM2.5 category distribution"></canvas></div>
+          <p class="muted small">Bands applied to daily means: Good &lt;25, Fair 25–50, Poor 50–100, Very poor 100–300, Extremely poor ≥300 µg/m³.</p>
+        </section>
+        <section class="card">
+          <h2>Station summary</h2>
+          <div class="table-wrap">
+            <table class="data" id="summary-table">
+              <thead><tr><th>Station</th><th>Days</th><th>Average</th><th>Peak day</th><th>Peak</th><th>Days over limit</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Exceedance alerts</h2>
+          <span class="muted small" id="alerts-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="alerts-table">
+            <thead><tr><th>Date</th><th>Station</th><th>Pollutant</th><th>24-h mean</th><th>Limit</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer class="foot">
+    Data: OpenAQ archive (NSW Government stations). Built on AWS: CloudFront · S3 · Cognito · API Gateway · Lambda · SQS · DynamoDB · SNS · EventBridge · CloudWatch.
+  </footer>
+
+  <script src="config.js"></script>
+  <script src="vendor/chart.umd.js"></script>
+  <script src="auth.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

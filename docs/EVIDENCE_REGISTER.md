@@ -7,7 +7,7 @@ deployment and screenshot have not been done yet. Capture instructions:
 
 | ID | Requirement | Service | Filename | Where | Must be visible | Proves | Status |
 |---|---|---|---|---|---|---|---|
-| E01 | Architecture | All | 01_architecture.png | Diagram you draw | Every box and arrow in ARCHITECTURE.md | Distributed design matches what is deployed | NOT STARTED |
+| E01 | Architecture | All | 01_architecture.png | Generated from deploy/template.yaml (source: docs/architecture.svg) | Every box and arrow in ARCHITECTURE.md | Distributed design matches what is deployed | DONE |
 | E02 | Deployment as code | CloudFormation | 02_cloudformation_stack_resources.png | CloudFormation → aqmon-stack → Resources | CREATE_COMPLETE, resource types | All services deployed in your account | NOT STARTED |
 | E03 | Cloud storage | S3 | 03_s3_raw_bucket_objects.png (+03b) | S3 → aqmon-raw-… → raw/, processed/ | Bucket name, uploaded CSVs, JSON summaries, times | Storage holds and is used by the app | NOT STARTED |
 | E04 | Storage security | S3 | 04_s3_bucket_security.png (+04b) | Bucket → Permissions / Properties | Block public access On, TLS-only policy, SSE-S3, versioning | Secure storage | NOT STARTED |

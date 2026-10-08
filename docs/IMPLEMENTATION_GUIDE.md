@@ -42,7 +42,6 @@ Status values: DONE · IN PROGRESS · NOT STARTED · NEEDS EVIDENCE · FAILED ·
 ### STEP 3.2 Get the code
 ```bash
 git clone https://github.com/Nafis878/AWS.git aqmon && cd aqmon
-git checkout claude/festive-meitner-1ur5t4   # until it is merged into main
 ```
 
 ---

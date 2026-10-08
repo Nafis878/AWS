@@ -40,17 +40,17 @@ Run in the development environment with headless Chromium:
 
 | Test ID | Component | Test | Expected | Actual | Status | Evidence |
 |---|---|---|---|---|---|---|
-| C01 | Deployment | `deploy.sh` | CREATE_COMPLETE, URLs printed | | Not run | E02 |
+| C01 | Deployment | `deploy.sh` | CREATE_COMPLETE, URLs printed | Stack deployed in us-east-1; deploy.sh printed Dashboard and API URLs | PASS | E02 |
 | C02 | Frontend | Open SiteUrl on mobile data | Landing page over HTTPS | | Not run | E27 |
 | C03 | Auth | Sign up + verify + sign in | Dashboard, viewer badge | | Not run | E19, E31 |
 | C04 | Authorisation | Viewer tries to upload | View-only message (API returns 403) | | Not run | E31 |
-| C05 | API security | curl without token | 401 | | Not run | E14 |
+| C05 | API security | curl without token | 401 | HTTP/2 401 {"message":"Unauthorized"} (checked 2026-10-08) | PASS | E14 |
 | C06 | API | DevTools /summary | 200 + JSON | | Not run | E13 |
 | C07 | Storage | Upload Jan CBD file | Object in raw/ | | Not run | E03 |
 | C08 | Queue | Same upload | SQS sent/deleted +1 | | Not run | E16 |
 | C09 | Processing | Same upload | Log "processed upload_id" | | Not run | E10 |
 | C10 | Database | Same upload | Items for 7428#pm25 | | Not run | E06 |
-| C11 | Notification | Same upload | Alert email with 13 days | | Not run | E21 |
+| C11 | Notification | Same upload | Alert email with 13 days | Email received 2026-10-08 for upload 20261008T065308Z-89c781f8: 13 days, same dates and values as the local run | PASS | E21 |
 | C12 | Integration | Charts update after upload | New data plotted | | Not run | E28, E29 |
 | C13 | Validation | Upload bad.csv | Job FAILED with reason | | Not run | E30 |
 | C14 | Fault tolerance | Poison message | DLQ 1 message, alarm, email | | Not run | E17, E25 |

@@ -190,8 +190,9 @@ def store_alerts(exceedances, upload_id):
 
 
 def notify(exceedances, summary):
+    labels = {"pm25": "PM2.5", "pm10": "PM10"}
     lines = [
-        f"{e['date']}  {e['station_name']:<20} {e['parameter'].upper():<5} "
+        f"{e['date']}  {e['station_name']:<20} {labels.get(e['parameter'], e['parameter'].upper()):<5} "
         f"24h mean {e['mean']:.1f} {e['units']} (limit {e['limit']:.0f})"
         for e in sorted(exceedances, key=lambda e: (e["date"], e["station_name"], e["parameter"]))
     ]
